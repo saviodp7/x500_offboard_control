@@ -75,14 +75,20 @@ geometry_msgs::msg::Pose X500OffboardControl::enu_to_ned_pose(const geometry_msg
     ned_pose.position.y = enu_pose.position.x;
     ned_pose.position.z = -enu_pose.position.z;
 
-    tf2::Quaternion enu_quat; tf2::fromMsg(enu_pose.orientation, enu_quat);
+    // Orientation conversion ENU -> NED
+    tf2::Quaternion enu_quat;
+    tf2::fromMsg(enu_pose.orientation, enu_quat);
     tf2::Matrix3x3 m(enu_quat);
-    double r, p, y; m.getRPY(r, p, y);
-    double yaw_ned = y + M_PI/2.0;
-    while (yaw_ned >  M_PI) yaw_ned -= 2*M_PI;
+    double r, p, y;
+    m.getRPY(r, p, y);
+    double yaw_ned = -y + M_PI/2.0;
+    while (yaw_ned > M_PI) yaw_ned -= 2*M_PI;
     while (yaw_ned < -M_PI) yaw_ned += 2*M_PI;
-    tf2::Quaternion ned_q; ned_q.setRPY(r, p, yaw_ned);
+
+    tf2::Quaternion ned_q;
+    ned_q.setRPY(r, p, yaw_ned);
     ned_pose.orientation = tf2::toMsg(ned_q);
+
     return ned_pose;
 }
 
