@@ -54,6 +54,9 @@ private:
     px4_msgs::msg::VehicleLocalPosition::SharedPtr current_local_pos_;
     px4_msgs::msg::VehicleStatus vehicle_status_{};
     px4_msgs::msg::TrajectorySetpoint::SharedPtr current_waypoint_{};
+    std::shared_ptr<px4_msgs::msg::TrajectorySetpoint> last_valid_setpoint_;
+    rclcpp::Time last_waypoint_time_{rclcpp::Time(0, 0, RCL_ROS_TIME)};
+    static constexpr double WAYPOINT_TIMEOUT_SECONDS_ = 1.0;
 
     // Offset ODOM->PX4 in NED
     struct Offset { double x{0.0}, y{0.0}, z{0.0}; };
@@ -91,6 +94,7 @@ private:
     // Publishing functions
     void publish_offboard_control_heartbeat_signal();
     void publish_takeoff_setpoint();
+    void publish_hover_setpoint();
     void publish_vehicle_command(uint16_t command,
                                  float param1 = 0.0f,
                                  float param2 = 0.0f,

@@ -32,8 +32,8 @@ X500OffboardControl::X500OffboardControl()
     waypoint_subscriber_ = this->create_subscription<px4_msgs::msg::TrajectorySetpoint>(
         "/offboard/waypoint", 10, std::bind(&X500OffboardControl::waypoint_callback, this, _1));
 
-    // Timer (5 Hz)
-    timer_ = this->create_wall_timer(200ms, std::bind(&X500OffboardControl::timer_callback, this));
+    // Timer (10 Hz)
+    timer_ = this->create_wall_timer(100ms, std::bind(&X500OffboardControl::timer_callback, this));
 
     RCLCPP_INFO(logger_, "🚁 x500 Offboard Control Node Initialized!");
 }
@@ -117,6 +117,13 @@ void X500OffboardControl::waypoint_callback(const px4_msgs::msg::TrajectorySetpo
     enu_pose.position.z = msg->position[2];
     tf2::Quaternion enu_q; enu_q.setRPY(0.0, 0.0, msg->yaw); enu_pose.orientation = tf2::toMsg(enu_q);
 
+    last_valid_setpoint_ = std::make_shared<px4_msgs::msg::TrajectorySetpoint>();
+    last_valid_setpoint_->position[0] = msg->position[0];  // ENU X
+    last_valid_setpoint_->position[1] = msg->position[1];  // ENU Y  
+    last_valid_setpoint_->position[2] = msg->position[2];  // ENU Z
+    last_valid_setpoint_->yaw = msg->yaw;                  // ENU Yaw
+    last_waypoint_time_ = this->get_clock()->now();
+
     auto ned_pose = enu_to_ned_pose(enu_pose);
 
     // Apply offset (in NED)
@@ -137,6 +144,10 @@ void X500OffboardControl::waypoint_callback(const px4_msgs::msg::TrajectorySetpo
     double r,p,yaw_ned; tf2::Matrix3x3(ned_q).getRPY(r,p,yaw_ned);
     current_waypoint_->yaw = yaw_ned;
     current_waypoint_->yawspeed = msg->yawspeed;
+
+    RCLCPP_DEBUG(logger_, "📍 New waypoint received | ENU: [%.3f %.3f %.3f] yaw=%.2f°",
+        last_valid_setpoint_->position[0], last_valid_setpoint_->position[1], last_valid_setpoint_->position[2], 
+        last_valid_setpoint_->yaw * 180.0 / M_PI);
 }
 
 X500OffboardControl::Position X500OffboardControl::get_current_position() const
@@ -202,6 +213,14 @@ void X500OffboardControl::publish_takeoff_setpoint()
     enu_pose.position.z = takeoff_target_altitude_.value();
     tf2::Quaternion q; q.setRPY(0,0,0); enu_pose.orientation = tf2::toMsg(q);
 
+   // Memorize takeoff setpoint ENU
+    last_valid_setpoint_ = std::make_shared<px4_msgs::msg::TrajectorySetpoint>();
+    last_valid_setpoint_->position[0] = enu_pose.position.x;  // ENU X
+    last_valid_setpoint_->position[1] = enu_pose.position.y;  // ENU Y
+    last_valid_setpoint_->position[2] = enu_pose.position.z;  // ENU Z
+    last_valid_setpoint_->yaw = 0.0;  // ENU yaw
+    last_waypoint_time_ = this->get_clock()->now();
+
     // Convert to NED then apply offset ONCE
     auto ned_pose = enu_to_ned_pose(enu_pose);
     ned_pose.position.x += odom_to_px4_offset_.x;
@@ -219,6 +238,11 @@ void X500OffboardControl::publish_takeoff_setpoint()
     msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
 
     trajectory_setpoint_publisher_->publish(msg);
+
+    RCLCPP_DEBUG_THROTTLE(logger_, *get_clock(), 3000,
+    "🚀 Takeoff setpoint | ENU: [%.3f %.3f %.3f] yaw=%.2f°",
+    last_valid_setpoint_->position[0], last_valid_setpoint_->position[1], last_valid_setpoint_->position[2],
+    last_valid_setpoint_->yaw * 180.0 / M_PI);
 }
 
 bool X500OffboardControl::is_takeoff_complete()
@@ -236,6 +260,50 @@ bool X500OffboardControl::is_takeoff_complete()
                     curr_alt, target_alt, p.x, p.y, p.z);
     }
     return takeoff_completed_;
+}
+
+void X500OffboardControl::publish_hover_setpoint()
+{
+    if (!last_valid_setpoint_) {
+        RCLCPP_WARN(logger_, "No valid setpoint available for hold position");
+        return;
+    }
+    
+    // Convert last valid setpoint ENU -> NED 
+    geometry_msgs::msg::Pose enu_pose;
+    enu_pose.position.x = last_valid_setpoint_->position[0];  // ENU X
+    enu_pose.position.y = last_valid_setpoint_->position[1];  // ENU Y
+    enu_pose.position.z = last_valid_setpoint_->position[2];  // ENU Z
+    
+    tf2::Quaternion enu_q;
+    enu_q.setRPY(0.0, 0.0, last_valid_setpoint_->yaw);
+    enu_pose.orientation = tf2::toMsg(enu_q);
+    
+    // Adding offset
+    auto ned_pose = enu_to_ned_pose(enu_pose);
+    ned_pose.position.x += odom_to_px4_offset_.x;
+    ned_pose.position.y += odom_to_px4_offset_.y;
+    ned_pose.position.z += odom_to_px4_offset_.z;
+    
+    // Create and publish NED msg to PX4
+    px4_msgs::msg::TrajectorySetpoint msg{};
+    msg.position[0] = ned_pose.position.x;
+    msg.position[1] = ned_pose.position.y;
+    msg.position[2] = ned_pose.position.z;
+    
+    tf2::Quaternion ned_q;
+    tf2::fromMsg(ned_pose.orientation, ned_q);
+    double r, p, yaw_ned;
+    tf2::Matrix3x3(ned_q).getRPY(r, p, yaw_ned);
+    msg.yaw = yaw_ned;
+        
+    msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
+    trajectory_setpoint_publisher_->publish(msg);
+
+    RCLCPP_INFO_THROTTLE(logger_, *get_clock(), 5000,
+        "🔒 Holding last setpoint | ENU: [%.3f %.3f %.3f] yaw=%.2f°",
+        last_valid_setpoint_->position[0], last_valid_setpoint_->position[1], last_valid_setpoint_->position[2],
+        last_valid_setpoint_->yaw * 180.0 / M_PI);
 }
 
 void X500OffboardControl::publish_vehicle_command(uint16_t command,
@@ -258,7 +326,7 @@ void X500OffboardControl::timer_callback()
     publish_offboard_control_heartbeat_signal();
 
     if (!current_odom_) {
-        RCLCPP_DEBUG_THROTTLE(logger_, *this->get_clock(), 5000, "⏳ Waiting for odometry data...");
+        RCLCPP_WARN_THROTTLE(logger_, *this->get_clock(), 5000, "⏳ Waiting for odometry data...");
         return;
     }
 
@@ -268,38 +336,39 @@ void X500OffboardControl::timer_callback()
     }
 
     if (vehicle_status_.nav_state == px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_OFFBOARD) {
-        if (current_waypoint_) {
+        
+        // Check if we have a valid waypoint and if it's still fresh
+        bool has_fresh_waypoint = current_waypoint_ && 
+            (this->get_clock()->now() - last_waypoint_time_).seconds() < WAYPOINT_TIMEOUT_SECONDS_;
+        
+        if (has_fresh_waypoint) {
+            // Publish the current waypoint
             current_waypoint_->timestamp = this->get_clock()->now().nanoseconds() / 1000;
             trajectory_setpoint_publisher_->publish(*current_waypoint_);
             
-            // Convert NED to ENU for waypoint coordinates
+            // Convert NED to ENU for waypoint coordinates (logging)
             double waypoint_enu_x = current_waypoint_->position[1];   // NED Y -> ENU X
             double waypoint_enu_y = current_waypoint_->position[0];   // NED X -> ENU Y  
             double waypoint_enu_z = -current_waypoint_->position[2];  // NED -Z -> ENU Z
             
-            // Convert yaw from NED to ENU frame
-            double waypoint_yaw_enu = current_waypoint_->yaw + M_PI/2;  // NED to ENU yaw conversion
-            if (waypoint_yaw_enu > M_PI) waypoint_yaw_enu -= 2*M_PI;   // Normalize to [-π, π]
+            double waypoint_yaw_enu = current_waypoint_->yaw + M_PI/2;
+            if (waypoint_yaw_enu > M_PI) waypoint_yaw_enu -= 2*M_PI;
             
-            // For RPY display (assuming roll=0, pitch=0 for trajectory setpoint)
-            double roll = 0.0;
-            double pitch = 0.0;
-            double yaw = waypoint_yaw_enu;
+            double roll = 0.0, pitch = 0.0, yaw = waypoint_yaw_enu;
             
             RCLCPP_INFO_THROTTLE(logger_, *get_clock(), 3000,
-                "🧭 Current waypoint | Timestamp: %lu μs\n"
-                "   Target NED: [%.3f %.3f %.3f] yaw=%.2f (%.1f°)\n"
-                "   Target ENU: [%.3f %.3f %.3f] RPY=[%.2f %.2f %.2f] (%.1f° %.1f° %.1f°)\n",
+                "🧭 Following waypoint | Timestamp: %lu μs\n"
+                "   Target ENU: [%.3f %.3f %.3f] RPY=[%.2f %.2f %.2f] (%.1f° %.1f° %.1f°)",
                 current_waypoint_->timestamp,
-                current_waypoint_->position[0], current_waypoint_->position[1], current_waypoint_->position[2],
-                current_waypoint_->yaw, current_waypoint_->yaw * 180.0 / M_PI,
                 waypoint_enu_x, waypoint_enu_y, waypoint_enu_z,
                 roll, pitch, yaw,
                 roll * 180.0 / M_PI, pitch * 180.0 / M_PI, yaw * 180.0 / M_PI);
                 
-        } else if (!is_takeoff_complete()) {
-            publish_takeoff_setpoint();
+        } else if (is_takeoff_complete()) {
+            // No fresh waypoint and takeoff is complete -> hover
+            publish_hover_setpoint();
         } else {
+            // Still taking off
             publish_takeoff_setpoint();
         }
     }
